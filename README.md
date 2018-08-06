@@ -1,6 +1,6 @@
 # Learning-based Video Motion Magnification
 
-Tensorflow implementation of Learning-based Video Motion Magnification. [\[Project page\]](https://people.csail.mit.edu/tiam/deepmag/) [\[Paper\]](https://arxiv.org/abs/1804.02684)
+Tensorflow implementation of Learning-based Video Motion Magnification. [\[Project page\]](https://people.csail.mit.edu/tiam/deepmag/) [\[Paper\]](https://arxiv.org/abs/1804.02684) [\[Data\]](https://groups.csail.mit.edu/graphics/deep_motion_mag/data/readme.txt)
 
 Collaborators: 
 \*(Tae-Hyun Oh, Ronnachai "Tiam" Jaroensri), Changil Kim, Mohamed A. Elgharib, Fr&eacute;do Durand, William T. Freeman, Wojciech Matusik
