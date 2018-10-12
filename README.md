@@ -62,7 +62,15 @@ For custom video and output location, you should look into modifying the two scr
 
 # Training
 
-To be updated.
+Use the `convert_3frames_data_to_tfrecords.py` utilities to convert your dataset into `tfrecords`, or download the pre-processed `tfrecords` (see [here](https://groups.csail.mit.edu/graphics/deep_motion_mag/data/readme.txt)).
+
+Set the data path in the config file, and run the training script:
+
+```
+bash train.sh configs/<your config file>.conf
+```
+
+Be sure to configure your GPU appropriately (e.g. `export CUDA_VISIBLE_DEVICES=...`).
 
 # Citation
 
