@@ -4,16 +4,20 @@ import os
 import tensorflow as tf
 import numpy as np
 import cv2
+import time
 
 from glob import glob
-from scipy.signal import lfilter, firwin, butter
+from scipy.signal import firwin, butter
 from functools import partial
 from tqdm import tqdm, trange
 from subprocess import call
 
+from modules import L1_loss
 from modules import res_encoder, res_decoder, res_manipulator
 from modules import residual_block, conv2d
 from utils import load_train_data, mkdir, imread, save_images
+from preprocessor import preprocess_image, preproc_color
+from data_loader import read_and_decode_3frames
 
 # Change here if you use ffmpeg.
 DEFAULT_VIDEO_CONVERTER = 'avconv'
@@ -509,12 +513,156 @@ class MagNet3Frames(object):
 
     # Training code.
     def _build_training_graph(self, train_config):
-        raise NotImplementedError()
+        self.global_step = tf.Variable(0, trainable=False)
+        filename_queue = tf.train.string_input_producer(
+                            [os.path.join(train_config["dataset_dir"],
+                                          'train.tfrecords')],
+                            num_epochs=train_config["num_epochs"])
+        frameA, frameB, frameC, frameAmp, amplification_factor = \
+            read_and_decode_3frames(filename_queue,
+                                    (train_config["image_height"],
+                                     train_config["image_width"],
+                                     self.n_channels))
+        min_after_dequeue = 1000
+        num_threads = 16
+        capacity = min_after_dequeue + \
+            (num_threads + 2) * train_config["batch_size"]
+
+        frameA, frameB, frameC, frameAmp, amplification_factor = \
+            tf.train.shuffle_batch([frameA,
+                                    frameB,
+                                    frameC,
+                                    frameAmp,
+                                    amplification_factor],
+                                   batch_size=train_config["batch_size"],
+                                   capacity=capacity,
+                                   num_threads=num_threads,
+                                   min_after_dequeue=min_after_dequeue)
+
+        frameA = preprocess_image(frameA, train_config)
+        frameB = preprocess_image(frameB, train_config)
+        frameC = preprocess_image(frameC, train_config)
+        self.loss_function = partial(self._loss_function,
+                                     train_config=train_config)
+        self.output = self.image_transformer(frameA,
+                                             frameB,
+                                             amplification_factor,
+                                             [train_config["image_height"],
+                                              train_config["image_width"]],
+                                             self.arch_config, True, False)
+        self.reg_loss = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+        if self.reg_loss and train_config["weight_decay"] > 0.0:
+            print("Adding Regularization Weights.")
+            self.loss = self.loss_function(self.output, frameAmp) + \
+                train_config["weight_decay"] * tf.add_n(self.reg_loss)
+        else:
+            print("No Regularization Weights.")
+            self.loss = self.loss_function(self.output, frameAmp)
+        # Add regularization more
+        # TODO: Hardcoding the network name scope here.
+        with tf.variable_scope('ynet_3frames/encoder', reuse=True):
+            texture_c, shape_c = self._encoder(frameC)
+            self.loss = self.loss + \
+                train_config["texture_loss_weight"] * L1_loss(texture_c, self.texture_a) + \
+                train_config["shape_loss_weight"] * L1_loss(shape_c, self.shape_b)
+
+        self.loss_sum = tf.summary.scalar('train_loss', self.loss)
+        self.image_sum = tf.summary.image('train_B_OUT',
+                                          tf.concat([frameB, self.output],
+                                                    axis=2),
+                                          max_outputs=2)
+        if self.n_channels == 3:
+            self.image_comp_sum = tf.summary.image('train_GT_OUT',
+                                                   frameAmp - self.output,
+                                                   max_outputs=2)
+            self.image_orig_comp_sum = tf.summary.image('train_ORIG_OUT',
+                                                        frameA - self.output,
+                                                        max_outputs=2)
+        else:
+            self.image_comp_sum = tf.summary.image('train_GT_OUT',
+                                                   tf.concat([frameAmp,
+                                                              self.output,
+                                                              frameAmp],
+                                                             axis=3),
+                                                   max_outputs=2)
+            self.image_orig_comp_sum = tf.summary.image('train_ORIG_OUT',
+                                                        tf.concat([frameA,
+                                                                   self.output,
+                                                                   frameA],
+                                                                  axis=3),
+                                                        max_outputs=2)
+        self.saver = tf.train.Saver(max_to_keep=train_config["ckpt_to_keep"])
 
     # Loss function
     def _loss_function(self, a, b, train_config):
-        raise NotImplementedError()
+        # Use train_config to implement more advance losses.
+        with tf.variable_scope("loss_function"):
+            return L1_loss(a, b) * train_config["l1_loss_weight"]
 
     def train(self, train_config):
-        raise NotImplementedError()
+        # Define training graphs
+        self._build_training_graph(train_config)
+
+        self.lr = tf.train.exponential_decay(train_config["learning_rate"],
+                                             self.global_step,
+                                             train_config["decay_steps"],
+                                             train_config["lr_decay"],
+                                             staircase=True)
+        self.optim_op = tf.train.AdamOptimizer(self.lr,
+                                               beta1=train_config["beta1"]) \
+            .minimize(self.loss,
+                      var_list=tf.trainable_variables(),
+                      global_step=self.global_step)
+
+        ginit_op = tf.global_variables_initializer()
+        linit_op = tf.local_variables_initializer()
+        self.sess.run([ginit_op, linit_op])
+
+        self.writer = tf.summary.FileWriter(train_config["logs_dir"],
+                                            self.sess.graph)
+        coord = tf.train.Coordinator()
+        threads = tf.train.start_queue_runners(sess=self.sess, coord=coord)
+
+        start_time = time.time()
+        for v in tf.trainable_variables():
+            print(v)
+        if train_config["continue_train"] and \
+                self.load(train_config["checkpoint_dir"]):
+            print('[*] Load Success')
+        elif train_config["restore_dir"] and \
+                self.load(train_config["restore_dir"],
+                          tf.train.Saver(var_list=tf.trainable_variables())):
+            self.sess.run(self.global_step.assign(0))
+            print('[*] Restore success')
+        else:
+            print('Training from scratch.')
+        try:
+            while not coord.should_stop():
+                _, loss_sum_str = self.sess.run([self.optim_op, self.loss_sum])
+                global_step = self.sess.run(self.global_step)
+                self.writer.add_summary(loss_sum_str, global_step)
+
+                if global_step % 100 == 0:
+                    # Write image summary.
+                    img_sum_str, img_comp_str, img_orig_str = \
+                            self.sess.run([self.image_sum,
+                                           self.image_comp_sum,
+                                           self.image_orig_comp_sum])
+                    self.writer.add_summary(img_sum_str, global_step)
+                    self.writer.add_summary(img_comp_str, global_step)
+                    self.writer.add_summary(img_orig_str, global_step)
+
+                elapsed_time = time.time() - start_time
+                print ("Steps: %2d time: %4.4f (%4.4f steps/sec)" % (
+                    global_step, elapsed_time,
+                    float(global_step) / elapsed_time))
+
+                if np.mod(global_step, train_config["save_freq"]) == 2:
+                    self.save(train_config["checkpoint_dir"], global_step)
+
+        except tf.errors.OutOfRangeError:
+            print('Done Training.')
+        finally:
+            coord.request_stop()
+            coord.join(threads)
 
